@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+data/
+results/
+logs/
+checkpoints/
+backups/
+windows*/
+
+*.csv
+*.json
+*.log
+*.pkl
