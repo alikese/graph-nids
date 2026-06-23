@@ -50,7 +50,7 @@ class SuspiciousEdgeRecord:
     attack_similarity_score: float
     structural_expansion_score: float
     attack_chain_score: float
-    ttl: int
+    ttl: Optional[int]
     first_seen_window: int
     last_seen_window: int
     suspicious_window_count: int = 1
@@ -106,12 +106,12 @@ class SuspiciousEdgeHistory:
     可疑边的短期证据缓冲区。
 
     使用方式:
-    1) 当前分数位于 [theta_suspicious, theta_attack) 时进入可疑集合。
-    2) 每个窗口调用 update_window()，未延续的记录会降低 TTL 并衰减证据。
-    3) 同边延续且分数、攻击相似度或结构扩张增强时，可升级为攻击。
+    1) 当前分数位于 (theta_suspicious, theta_attack) 时进入可疑集合。
+    2) 每个窗口调用 update_window()，未被新证据增强的记录持续按 evidence_decay 衰减。
+    3) 新证据高于衰减后证据时覆盖抬高；分数、攻击相似度或结构扩张增强时，可升级为攻击。
     4) 可疑边通过 diffusion_weight() 以低于攻击边的权重参与扩散。
     5) should_update_behavior_baseline() 对可疑边返回 False，避免污染基线。
-    6) TTL 到期且 evidence_score 下降到 release_threshold 后释放为正常。
+    6) evidence_score 衰减到 release_threshold 后释放为正常，不再使用固定 TTL 门槛。
 
     升级后的攻击边会从本缓冲区移除，应由现有 History.edge_label 接管。
     """
@@ -119,10 +119,10 @@ class SuspiciousEdgeHistory:
     def __init__(
         self,
         theta_suspicious: float = 0.55,
-        theta_attack: float = 0.80,
-        ttl_windows: int = 3,
-        evidence_decay: float = 0.65,
-        release_threshold: float = 0.35,
+        theta_attack: float = 0.70,
+        ttl_windows: Optional[int] = None,
+        evidence_decay: float = 0.85,
+        release_threshold: float = 0.40,
         promotion_evidence_threshold: Optional[float] = None,
         min_consecutive_windows: int = 2,
         min_reinforcing_signals: int = 2,
@@ -138,12 +138,12 @@ class SuspiciousEdgeHistory:
             raise ValueError(
                 "阈值必须满足 0 <= theta_suspicious < theta_attack <= 1。"
             )
-        if ttl_windows <= 0:
-            raise ValueError("ttl_windows 必须大于 0。")
+        if ttl_windows is not None and ttl_windows <= 0:
+            raise ValueError("ttl_windows 必须为 None 或大于 0。")
         if not 0.0 < evidence_decay < 1.0:
             raise ValueError("evidence_decay 必须位于 (0, 1)。")
-        if not 0.0 <= release_threshold < theta_suspicious:
-            raise ValueError("release_threshold 必须低于 theta_suspicious。")
+        if not 0.0 <= release_threshold <= theta_suspicious:
+            raise ValueError("release_threshold 必须不高于 theta_suspicious。")
         if min_consecutive_windows <= 0 or min_reinforcing_signals <= 0:
             raise ValueError("连续窗口数和增强信号数必须大于 0。")
         if not 0.0 <= suspicious_diffusion_weight < attack_diffusion_weight:
@@ -151,7 +151,7 @@ class SuspiciousEdgeHistory:
 
         self.theta_suspicious = float(theta_suspicious)
         self.theta_attack = float(theta_attack)
-        self.ttl_windows = int(ttl_windows)
+        self.ttl_windows = int(ttl_windows) if ttl_windows is not None else None
         self.evidence_decay = float(evidence_decay)
         self.release_threshold = float(release_threshold)
         self.promotion_evidence_threshold = float(
@@ -215,13 +215,14 @@ class SuspiciousEdgeHistory:
         )
 
     def _age_record(self, record: SuspiciousEdgeRecord) -> bool:
-        record.ttl -= 1
+        if record.ttl is not None:
+            record.ttl -= 1
         record.windows_since_seen += 1
         record.consecutive_suspicious_count = 0
         record.evidence_score = _clamp(
             record.evidence_score * self.evidence_decay
         )
-        return record.ttl <= 0 and record.evidence_score <= self.release_threshold
+        return record.evidence_score <= self.release_threshold
 
     def _create_record(
         self,
@@ -273,11 +274,11 @@ class SuspiciousEdgeHistory:
             reinforcing_signals.append("structural_expansion_enhanced")
 
         current_evidence = self._window_evidence(observation)
-        bonus = self.reinforcing_signal_bonus * len(reinforcing_signals)
+        decayed_evidence = _clamp(record.evidence_score * self.evidence_decay)
+        reinforcing_bonus_count = max(len(reinforcing_signals) - 1, 0)
+        bonus = self.reinforcing_signal_bonus * reinforcing_bonus_count
         record.evidence_score = _clamp(
-            self.evidence_decay * record.evidence_score
-            + (1.0 - self.evidence_decay) * current_evidence
-            + bonus
+            max(decayed_evidence, current_evidence) + bonus
         )
         record.previous_score = previous_score
         record.current_score = score
@@ -339,7 +340,7 @@ class SuspiciousEdgeHistory:
         migrated_from: Dict[Hashable, Hashable] = {}
         protected_existing_keys: Set[Hashable] = set()
         for edge_key, observation in normalized_observations.items():
-            if edge_key in self.edges or _clamp(observation.score) < self.theta_suspicious:
+            if edge_key in self.edges or _clamp(observation.score) <= self.theta_suspicious:
                 continue
             candidates = continuity_candidates.get(
                 self._continuity_key(edge_key), []
@@ -361,7 +362,7 @@ class SuspiciousEdgeHistory:
                 result.released_normal_edges.add(edge_key)
                 result.decisions[edge_key] = SuspiciousEdgeDecision(
                     label="normal",
-                    reason="ttl_expired_and_evidence_decayed",
+                    reason="evidence_decayed_to_normal",
                     evidence_score=record.evidence_score,
                 )
 
@@ -394,7 +395,7 @@ class SuspiciousEdgeHistory:
                 )
                 continue
 
-            if score >= self.theta_suspicious:
+            if score > self.theta_suspicious:
                 record = self.edges.get(edge_key)
                 if record is None and previous_key is not None:
                     record = self.edges.pop(previous_key, None)
@@ -445,13 +446,13 @@ class SuspiciousEdgeHistory:
                 result.released_normal_edges.add(edge_key)
                 result.decisions[edge_key] = SuspiciousEdgeDecision(
                     label="normal",
-                    reason="ttl_expired_and_evidence_decayed",
+                    reason="evidence_decayed_to_normal",
                     evidence_score=record.evidence_score,
                 )
             else:
                 result.decisions[edge_key] = SuspiciousEdgeDecision(
                     label="suspicious",
-                    reason="cooling_down_before_release",
+                    reason="evidence_above_release_threshold",
                     evidence_score=record.evidence_score,
                 )
 

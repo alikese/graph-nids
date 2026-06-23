@@ -183,7 +183,7 @@ def predicted_label_from_score(
         return "attack"
     if score <= normal_threshold:
         return "normal"
-    return "unknown"
+    return "suspicious"
 
 
 def commit_window(

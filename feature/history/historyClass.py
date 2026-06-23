@@ -93,8 +93,10 @@ class History:
         self.recent_attack_edge_history = RecentAttackEdgeHistory(max_windows=5)
         self._recent_attack_recorded_window_count = 0
         self.suspicious_edge_history = SuspiciousEdgeHistory(
-            theta_suspicious=0.60,
+            theta_suspicious=0.55,
             theta_attack=0.70,
+            evidence_decay=0.85,
+            release_threshold=0.40,
             min_reinforcing_signals=3,
         )
         self.baseline_excluded_edge_keys: Set[Hashable] = set()
