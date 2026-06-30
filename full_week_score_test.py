@@ -199,6 +199,9 @@ def commit_window(
         suspicious_result = history.suspicious_edge_history.update_window(
             suspicious_observations
         )
+        for edge_key, decision in suspicious_result.decisions.items():
+            if edge_key in graph.edges:
+                final_edge_labels[edge_key] = decision.label
         for edge_key in suspicious_result.active_suspicious_edges:
             if edge_key in graph.edges:
                 final_edge_labels[edge_key] = "suspicious"
@@ -255,7 +258,12 @@ def commit_window(
         strong_attack_edges = {
             edge_key
             for edge_key, decision in suspicious_result.decisions.items()
-            if decision.reason == "score_reached_attack_threshold"
+            if decision.reason
+            in {
+                "score_reached_attack_threshold",
+                "auth_bruteforce_evidence",
+                "multi_window_evidence_strengthened",
+            }
         }
     history.record_previous_attack_destinations(
         attack_edge_keys=strong_attack_edges

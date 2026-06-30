@@ -130,6 +130,8 @@ class SuspiciousEdgeHistory:
         min_similarity_rise: float = 0.05,
         min_structural_rise: float = 0.05,
         attack_chain_threshold: float = 0.85,
+        auth_attack_threshold: float = 0.80,
+        auth_suspicious_threshold: float = 0.60,
         reinforcing_signal_bonus: float = 0.04,
         suspicious_diffusion_weight: float = 0.25,
         attack_diffusion_weight: float = 1.0,
@@ -165,6 +167,8 @@ class SuspiciousEdgeHistory:
         self.min_similarity_rise = float(min_similarity_rise)
         self.min_structural_rise = float(min_structural_rise)
         self.attack_chain_threshold = float(attack_chain_threshold)
+        self.auth_attack_threshold = float(auth_attack_threshold)
+        self.auth_suspicious_threshold = float(auth_suspicious_threshold)
         self.reinforcing_signal_bonus = float(reinforcing_signal_bonus)
         self.suspicious_diffusion_weight = float(suspicious_diffusion_weight)
         self.attack_diffusion_weight = float(attack_diffusion_weight)
@@ -208,11 +212,54 @@ class SuspiciousEdgeHistory:
 
     @staticmethod
     def _window_evidence(observation: SuspiciousEdgeObservation) -> float:
-        return _clamp(
-            0.70 * _clamp(observation.score)
-            + 0.18 * _clamp(observation.attack_similarity_score)
-            + 0.12 * _clamp(observation.structural_expansion_score)
+        sub_scores = observation.sub_scores or {}
+        feature_vector = (
+            observation.feature_vector
+            if isinstance(observation.feature_vector, Mapping)
+            else {}
         )
+        auth_score = max(
+            _clamp(sub_scores.get("auth_bruteforce_score", 0.0)),
+            _clamp(feature_vector.get("auth_bruteforce_score", 0.0)),
+        )
+        return _clamp(
+            0.64 * _clamp(observation.score)
+            + 0.16 * _clamp(observation.attack_similarity_score)
+            + 0.10 * _clamp(observation.structural_expansion_score)
+            + 0.10 * auth_score
+        )
+
+    @staticmethod
+    def _auth_score(observation: SuspiciousEdgeObservation) -> float:
+        sub_scores = observation.sub_scores or {}
+        feature_vector = (
+            observation.feature_vector
+            if isinstance(observation.feature_vector, Mapping)
+            else {}
+        )
+        return max(
+            _clamp(sub_scores.get("auth_bruteforce_score", 0.0)),
+            _clamp(feature_vector.get("auth_bruteforce_score", 0.0)),
+        )
+
+    @staticmethod
+    def _has_attack_context(observation: SuspiciousEdgeObservation) -> bool:
+        feature_vector = (
+            observation.feature_vector
+            if isinstance(observation.feature_vector, Mapping)
+            else {}
+        )
+        return bool(feature_vector.get("has_attack_context", False))
+
+    def _direct_attack_allowed(
+        self,
+        observation: SuspiciousEdgeObservation,
+    ) -> bool:
+        if self._auth_score(observation) >= self.auth_attack_threshold:
+            return True
+        if self._has_attack_context(observation):
+            return True
+        return _clamp(observation.attack_similarity_score) > 0.0
 
     def _age_record(self, record: SuspiciousEdgeRecord) -> bool:
         if record.ttl is not None:
@@ -369,19 +416,29 @@ class SuspiciousEdgeHistory:
         for edge_key, observation in normalized_observations.items():
             score = _clamp(observation.score)
             attack_chain_score = _clamp(observation.attack_chain_score)
+            auth_score = self._auth_score(observation)
             previous_key = migrated_from.get(edge_key)
 
             if (
-                score >= self.theta_attack
+                (
+                    score >= self.theta_attack
+                    and self._direct_attack_allowed(observation)
+                )
                 or attack_chain_score >= self.attack_chain_threshold
+                or auth_score >= self.auth_attack_threshold
             ):
                 previous_record = self.edges.pop(edge_key, None)
                 if previous_record is None and previous_key is not None:
                     previous_record = self.edges.pop(previous_key, None)
                 evidence_score = (
-                    max(score, attack_chain_score, previous_record.evidence_score)
+                    max(
+                        score,
+                        attack_chain_score,
+                        auth_score,
+                        previous_record.evidence_score,
+                    )
                     if previous_record is not None
-                    else max(score, attack_chain_score)
+                    else max(score, attack_chain_score, auth_score)
                 )
                 result.promoted_attack_edges.add(edge_key)
                 result.decisions[edge_key] = SuspiciousEdgeDecision(
@@ -389,13 +446,20 @@ class SuspiciousEdgeHistory:
                     reason=(
                         "score_reached_attack_threshold"
                         if score >= self.theta_attack
-                        else "attack_chain_evidence"
+                        else (
+                            "attack_chain_evidence"
+                            if attack_chain_score >= self.attack_chain_threshold
+                            else "auth_bruteforce_evidence"
+                        )
                     ),
                     evidence_score=evidence_score,
                 )
                 continue
 
-            if score > self.theta_suspicious:
+            if (
+                score > self.theta_suspicious
+                or auth_score >= self.auth_suspicious_threshold
+            ):
                 record = self.edges.get(edge_key)
                 if record is None and previous_key is not None:
                     record = self.edges.pop(previous_key, None)

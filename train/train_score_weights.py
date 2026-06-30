@@ -125,7 +125,16 @@ def parse_args():
         type=Path,
         default=ROOT / "train" / "train_score_checkpoint.pkl",
     )
+    parser.add_argument(
+        "--internal-weights-path",
+        type=Path,
+        default=None,
+        help="加载已有 internal_weights 并跳过一级内部权重训练。",
+    )
     parser.add_argument("--prior-strength", type=float, default=0.20)
+    parser.add_argument("--top-level-f1-weight", type=float, default=0.50)
+    parser.add_argument("--top-level-recall-weight", type=float, default=0.30)
+    parser.add_argument("--top-level-precision-weight", type=float, default=0.20)
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--checkpoint-every", type=int, default=20)
     parser.add_argument(
@@ -137,6 +146,16 @@ def parse_args():
         "--eval-only",
         action="store_true",
         help="加载已有权重，只执行 two_level_trained_evaluation 阶段。",
+    )
+    parser.add_argument(
+        "--internal-only",
+        action="store_true",
+        help="只训练 internal_weights，top-level 权重保持默认值。",
+    )
+    parser.add_argument(
+        "--keep-checkpoint",
+        action="store_true",
+        help="训练完成后保留阶段 checkpoint，便于继续调二级目标。",
     )
     return parser.parse_args()
 
@@ -238,6 +257,153 @@ def train_weight_group(component_stats, default_weights, prior_strength):
     return weights, learned, details
 
 
+def threshold_counts(normal_stats, attack_stats, threshold):
+    index = min(
+        max(math.ceil(float(threshold) * normal_stats.bin_count), 0),
+        normal_stats.bin_count,
+    )
+    normal_positive = sum(normal_stats.bins[index:])
+    attack_positive = sum(attack_stats.bins[index:])
+    return normal_positive, attack_positive
+
+
+def binary_metrics_at_component_threshold(
+    normal_stats,
+    attack_stats,
+    threshold,
+):
+    normal_positive, attack_positive = threshold_counts(
+        normal_stats,
+        attack_stats,
+        threshold,
+    )
+    total_attack = attack_stats.count
+    predicted_positive = normal_positive + attack_positive
+    precision = (
+        attack_positive / predicted_positive
+        if predicted_positive > 0
+        else 0.0
+    )
+    recall = attack_positive / total_attack if total_attack > 0 else 0.0
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if precision + recall > 0.0
+        else 0.0
+    )
+    false_positive_rate = (
+        normal_positive / normal_stats.count
+        if normal_stats.count > 0
+        else 0.0
+    )
+    return {
+        "threshold": threshold,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_positive_rate": false_positive_rate,
+        "normal_positive": normal_positive,
+        "attack_positive": attack_positive,
+    }
+
+
+def train_top_level_metric_weight_group(
+    component_stats,
+    default_weights,
+    prior_strength,
+    f1_weight,
+    recall_weight,
+    precision_weight,
+):
+    if not 0.0 <= prior_strength <= 1.0:
+        raise ValueError("prior-strength must be between 0 and 1")
+    objective_weights = {
+        "f1": max(float(f1_weight), 0.0),
+        "recall": max(float(recall_weight), 0.0),
+        "precision": max(float(precision_weight), 0.0),
+    }
+    objective_total = sum(objective_weights.values())
+    if objective_total <= 0.0:
+        raise ValueError(
+            "at least one top-level objective weight must be positive"
+        )
+    objective_weights = {
+        name: value / objective_total
+        for name, value in objective_weights.items()
+    }
+
+    details = {}
+    signals = {}
+    for name in default_weights:
+        normal_stats = component_stats["normal"][name]
+        attack_stats = component_stats["attack"][name]
+        auc = component_auc(normal_stats, attack_stats)
+        threshold_metrics = [
+            binary_metrics_at_component_threshold(
+                normal_stats,
+                attack_stats,
+                threshold,
+            )
+            for threshold in THRESHOLDS
+        ]
+        for item in threshold_metrics:
+            item["objective"] = (
+                objective_weights["f1"] * item["f1"]
+                + objective_weights["recall"] * item["recall"]
+                + objective_weights["precision"] * item["precision"]
+            )
+        best = max(
+            threshold_metrics,
+            key=lambda item: (
+                item["objective"],
+                item["f1"],
+                item["recall"],
+                item["precision"],
+            ),
+        )
+        signal = max(best["objective"], 0.0)
+        signals[name] = signal
+        details[name] = {
+            "normal_count": normal_stats.count,
+            "attack_count": attack_stats.count,
+            "normal_mean": normal_stats.mean,
+            "attack_mean": attack_stats.mean,
+            "mean_gap": attack_stats.mean - normal_stats.mean,
+            "approximate_auc": auc,
+            "objective_weights": objective_weights,
+            "best_threshold": best["threshold"],
+            "best_threshold_precision": best["precision"],
+            "best_threshold_recall": best["recall"],
+            "best_threshold_f1": best["f1"],
+            "best_threshold_false_positive_rate": best[
+                "false_positive_rate"
+            ],
+            "metric_objective_signal": signal,
+            "threshold_metrics": threshold_metrics,
+        }
+
+    signal_total = sum(signals.values())
+    if signal_total <= 0.0:
+        learned = dict(default_weights)
+    else:
+        learned = {
+            name: signals[name] / signal_total
+            for name in default_weights
+        }
+    weights = {
+        name: (
+            prior_strength * default_weights[name]
+            + (1.0 - prior_strength) * learned[name]
+        )
+        for name in default_weights
+    }
+    weight_total = sum(weights.values())
+    weights = {
+        name: value / weight_total
+        for name, value in weights.items()
+    }
+    return weights, learned, details
+
+
 def reset_all_weights():
     reset_current_behavior_weights()
     EdgeActiveHistoryFeature.reset_finite_history_offset_weights()
@@ -268,6 +434,23 @@ def load_trained_weights(path):
     return {
         "internal_weights": payload["internal_weights"],
         "top_level_weights": payload["top_level_weights"],
+    }
+
+
+def load_internal_weights_payload(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    internal_weights = payload["internal_weights"]
+    apply_internal_weights(internal_weights)
+    return {
+        "internal_weights": internal_weights,
+        "internal_raw_learned_weights": payload.get(
+            "internal_raw_learned_weights",
+            {},
+        ),
+        "internal_training_details": payload.get(
+            "internal_training_details",
+            {},
+        ),
     }
 
 
@@ -718,84 +901,144 @@ def main():
         f"training_start days={','.join(args.days)} "
         f"windows={len(files)} checkpoint={args.checkpoint_path}",
     )
-    (
-        baseline_scope,
-        internal_feature_stats,
-        _,
-        baseline_elapsed,
-    ) = run_phase(
-        phase="level1_internal_training",
-        files=files,
-        days=args.days,
-        window_dir=args.window_dir,
-        progress_path=args.progress_path,
-        progress_every=args.progress_every,
-        checkpoint_path=args.checkpoint_path,
-        checkpoint_every=args.checkpoint_every,
-        collect_internal_features=True,
-    )
-    internal_weights = {}
-    internal_raw_weights = {}
-    internal_details = {}
-    for group_name, default_weights in INTERNAL_DEFAULT_WEIGHTS.items():
-        (
-            internal_weights[group_name],
-            internal_raw_weights[group_name],
-            internal_details[group_name],
-        ) = train_weight_group(
-            internal_feature_stats[group_name],
-            default_weights,
-            args.prior_strength,
+    baseline_scope = None
+    baseline_elapsed = 0.0
+    internal_weights_source = None
+    if args.internal_weights_path:
+        loaded_internal = load_internal_weights_payload(
+            args.internal_weights_path
         )
-    apply_internal_weights(internal_weights)
-    log_progress(
-        args.progress_path,
-        f"level1_complete internal_weights={internal_weights} "
-        f"elapsed_seconds={baseline_elapsed:.1f}",
-    )
+        internal_weights = loaded_internal["internal_weights"]
+        internal_raw_weights = loaded_internal[
+            "internal_raw_learned_weights"
+        ]
+        internal_details = loaded_internal["internal_training_details"]
+        internal_weights_source = str(args.internal_weights_path)
+        log_progress(
+            args.progress_path,
+            f"level1_skipped internal_weights_path="
+            f"{args.internal_weights_path}",
+        )
+    else:
+        (
+            baseline_scope,
+            internal_feature_stats,
+            _,
+            baseline_elapsed,
+        ) = run_phase(
+            phase="level1_internal_training",
+            files=files,
+            days=args.days,
+            window_dir=args.window_dir,
+            progress_path=args.progress_path,
+            progress_every=args.progress_every,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_every=args.checkpoint_every,
+            collect_internal_features=True,
+        )
+        internal_weights = {}
+        internal_raw_weights = {}
+        internal_details = {}
+        for group_name, default_weights in INTERNAL_DEFAULT_WEIGHTS.items():
+            (
+                internal_weights[group_name],
+                internal_raw_weights[group_name],
+                internal_details[group_name],
+            ) = train_weight_group(
+                internal_feature_stats[group_name],
+                default_weights,
+                args.prior_strength,
+            )
+        apply_internal_weights(internal_weights)
+        log_progress(
+            args.progress_path,
+            f"level1_complete internal_weights={internal_weights} "
+            f"elapsed_seconds={baseline_elapsed:.1f}",
+        )
 
-    (
-        internal_scope,
-        _,
-        top_level_stats,
-        internal_elapsed,
-    ) = run_phase(
-        phase="level2_total_score_training",
-        files=files,
-        days=args.days,
-        window_dir=args.window_dir,
-        progress_path=args.progress_path,
-        progress_every=args.progress_every,
-        checkpoint_path=args.checkpoint_path,
-        checkpoint_every=args.checkpoint_every,
-        collect_top_level_scores=True,
-    )
-    (
-        top_level_weights,
-        top_level_raw_weights,
-        top_level_details,
-    ) = train_weight_group(
-        top_level_stats,
-        DEFAULT_LOCAL_ANOMALY_WEIGHTS,
-        args.prior_strength,
-    )
-    set_local_anomaly_weights(top_level_weights)
-    log_progress(
-        args.progress_path,
-        f"level2_complete top_level_weights={top_level_weights} "
-        f"elapsed_seconds={internal_elapsed:.1f}",
-    )
+    internal_scope = None
+    internal_elapsed = 0.0
+    if args.internal_only:
+        top_level_weights = dict(DEFAULT_LOCAL_ANOMALY_WEIGHTS)
+        top_level_raw_weights = dict(DEFAULT_LOCAL_ANOMALY_WEIGHTS)
+        top_level_details = {
+            "skipped": True,
+            "reason": (
+                "internal-only mode keeps default top-level local "
+                "anomaly weights"
+            ),
+        }
+        reset_local_anomaly_weights()
+        log_progress(
+            args.progress_path,
+            f"level2_skipped internal_only=true "
+            f"top_level_weights={top_level_weights}",
+        )
+    else:
+        (
+            internal_scope,
+            _,
+            top_level_stats,
+            internal_elapsed,
+        ) = run_phase(
+            phase="level2_total_score_training",
+            files=files,
+            days=args.days,
+            window_dir=args.window_dir,
+            progress_path=args.progress_path,
+            progress_every=args.progress_every,
+            checkpoint_path=args.checkpoint_path,
+            checkpoint_every=args.checkpoint_every,
+            collect_top_level_scores=True,
+        )
+        (
+            top_level_weights,
+            top_level_raw_weights,
+            top_level_details,
+        ) = train_top_level_metric_weight_group(
+            top_level_stats,
+            DEFAULT_LOCAL_ANOMALY_WEIGHTS,
+            args.prior_strength,
+            args.top_level_f1_weight,
+            args.top_level_recall_weight,
+            args.top_level_precision_weight,
+        )
+        set_local_anomaly_weights(top_level_weights)
+        log_progress(
+            args.progress_path,
+            f"level2_complete top_level_weights={top_level_weights} "
+            f"elapsed_seconds={internal_elapsed:.1f}",
+        )
 
     weights_payload = {
         "training_days": args.days,
         "window_directory": str(args.window_dir),
         "window_count": len(files),
+        "training_mode": (
+            "internal_only"
+            if args.internal_only
+            else "two_level_metric"
+        ),
         "method": (
             "第一层对四类异常分数内部特征分别计算 attack-vs-normal "
-            "近似AUC区分信号；第二层对重新计算后的四类异常分数重复训练。"
-            "两层均使用 max(AUC-0.5, 0) 归一化，并与内置权重做先验混合。"
+            "近似AUC区分信号。"
+            + (
+                "本次启用 internal-only，第二层 top-level 权重保持默认值。"
+                if args.internal_only
+                else (
+                    "第二层对重新计算后的四类异常分数，按候选阈值下的 "
+                    "F1、Recall、Precision 综合目标训练。两层均将学习信号"
+                    "归一化，并与内置权重做先验混合。"
+                )
+            )
         ),
         "prior_strength": args.prior_strength,
+        "internal_weights_source": internal_weights_source,
+        "top_level_objective_weights": {
+            "f1": args.top_level_f1_weight,
+            "recall": args.top_level_recall_weight,
+            "precision": args.top_level_precision_weight,
+        },
         "internal_default_weights": INTERNAL_DEFAULT_WEIGHTS,
         "internal_raw_learned_weights": internal_raw_weights,
         "internal_weights": internal_weights,
@@ -826,23 +1069,38 @@ def main():
         "evaluation_days": args.days,
         "window_directory": str(args.window_dir),
         "window_count": len(files),
+        "training_mode": (
+            "internal_only"
+            if args.internal_only
+            else "two_level_metric"
+        ),
         "weights_path": str(args.weights_path),
         "checkpoint_path": str(args.checkpoint_path),
+        "internal_weights_source": internal_weights_source,
         "internal_default_weights": INTERNAL_DEFAULT_WEIGHTS,
         "trained_internal_weights": internal_weights,
         "internal_training_details": internal_details,
         "top_level_default_weights": DEFAULT_LOCAL_ANOMALY_WEIGHTS,
+        "top_level_objective_weights": {
+            "f1": args.top_level_f1_weight,
+            "recall": args.top_level_recall_weight,
+            "precision": args.top_level_precision_weight,
+        },
         "trained_top_level_weights": top_level_weights,
         "top_level_training_details": top_level_details,
-        "baseline": scope_result(
-            baseline_scope,
-            args.days,
-            baseline_elapsed,
+        "baseline": (
+            scope_result(
+                baseline_scope,
+                args.days,
+                baseline_elapsed,
+            )
+            if baseline_scope is not None
+            else None
         ),
         "internal_weights_only": scope_result(
-            internal_scope,
+            trained_scope if args.internal_only else internal_scope,
             args.days,
-            internal_elapsed,
+            trained_elapsed if args.internal_only else internal_elapsed,
         ),
         "trained_in_sample_evaluation": scope_result(
             trained_scope,
@@ -865,10 +1123,11 @@ def main():
         f"total_elapsed_seconds="
         f"{baseline_elapsed + internal_elapsed + trained_elapsed:.1f}",
     )
-    for phase in PHASES:
-        path = phase_checkpoint_path(args.checkpoint_path, phase)
-        if path.exists():
-            path.unlink()
+    if not args.keep_checkpoint:
+        for phase in PHASES:
+            path = phase_checkpoint_path(args.checkpoint_path, phase)
+            if path.exists():
+                path.unlink()
     if args.checkpoint_path.exists():
         args.checkpoint_path.unlink()
 

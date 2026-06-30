@@ -8,6 +8,38 @@ from feature.history.recentEdgeDetails import RecentEdgeDetails
 from feature.history.suspiciousEdgeHistory import SuspiciousEdgeHistory
 
 
+DEFAULT_BEHAVIOR_ROLE_WEIGHTS = {
+    "source_out_degree_quantile": 0.20,
+    "destination_in_degree_quantile": 0.15,
+    "normalized_byte_ratio": 0.15,
+    "source_role_drift": 0.20,
+    "destination_role_drift": 0.15,
+    "previous_attack_dst_to_src_mark": 0.15,
+}
+BEHAVIOR_ROLE_WEIGHTS = dict(DEFAULT_BEHAVIOR_ROLE_WEIGHTS)
+
+
+def _normalized_behavior_role_weights(weights):
+    cleaned = {
+        name: max(float(weights.get(name, 0.0)), 0.0)
+        for name in DEFAULT_BEHAVIOR_ROLE_WEIGHTS
+    }
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return dict(DEFAULT_BEHAVIOR_ROLE_WEIGHTS)
+    return {name: value / total for name, value in cleaned.items()}
+
+
+def set_behavior_role_weights(weights):
+    BEHAVIOR_ROLE_WEIGHTS.clear()
+    BEHAVIOR_ROLE_WEIGHTS.update(_normalized_behavior_role_weights(weights))
+
+
+def reset_behavior_role_weights():
+    BEHAVIOR_ROLE_WEIGHTS.clear()
+    BEHAVIOR_ROLE_WEIGHTS.update(DEFAULT_BEHAVIOR_ROLE_WEIGHTS)
+
+
 @dataclass
 class HistoryRecord:
     """
@@ -100,6 +132,8 @@ class History:
             min_reinforcing_signals=3,
         )
         self.baseline_excluded_edge_keys: Set[Hashable] = set()
+        self.current_node_keys: Set[Hashable] = set()
+        self.current_edge_keys: Set[Hashable] = set()
         # 当前窗口节点行为角色得分缓存，避免逐边重复计算节点分位数
         self.behavior_role_score_cache: Dict[str, Dict[str, float]] = {}
         self._behavior_role_score_cache_options: Optional[Tuple[bool, float]] = None
@@ -272,6 +306,8 @@ class History:
         节点更新当前快照；边按 merge_from_window_edge 进行长期累计。
         """
         window_committed = self._pending_window_staged
+        committed_node_keys = set(self.pending_nodes)
+        committed_edge_keys = set(self.pending_edges.edges)
 
         if self.pending_nodes:
             self._upsert_group(self.pending_nodes, self.nodes)
@@ -288,6 +324,8 @@ class History:
                 self.life_windows,
             )
             self._pending_window_staged = False
+            self.current_node_keys = committed_node_keys
+            self.current_edge_keys = committed_edge_keys
 
         self._clear_behavior_role_score_cache()
         return window_committed
@@ -320,7 +358,15 @@ class History:
             set(attack_edge_keys) if attack_edge_keys is not None else None
         )
         attack_dst_ips = set()
-        for edge_key, record in self.edges.items():
+        candidate_edge_keys = (
+            self.current_edge_keys
+            if self.current_edge_keys
+            else set(self.edges)
+        )
+        for edge_key in candidate_edge_keys:
+            record = self.edges.get(edge_key)
+            if record is None:
+                continue
             if not record.in_current_graph:
                 continue
             if selected_attack_edges is None:
@@ -361,16 +407,22 @@ class History:
         selected_attack_edges = (
             set(attack_edge_keys) if attack_edge_keys is not None else None
         )
-        current_attack_edge_keys = [
-            edge_key
-            for edge_key, record in self.edges.items()
-            if record.in_current_graph
-            and (
-                record.edge_label == "attack"
-                if selected_attack_edges is None
-                else edge_key in selected_attack_edges
-            )
-        ]
+        candidate_edge_keys = (
+            self.current_edge_keys
+            if self.current_edge_keys
+            else set(self.edges)
+        )
+        current_attack_edge_keys = []
+        for edge_key in candidate_edge_keys:
+            record = self.edges.get(edge_key)
+            if record is None or not record.in_current_graph:
+                continue
+            if selected_attack_edges is None:
+                if record.edge_label != "attack":
+                    continue
+            elif edge_key not in selected_attack_edges:
+                continue
+            current_attack_edge_keys.append(edge_key)
         self.recent_attack_edge_history.record_window(current_attack_edge_keys)
         self._recent_attack_recorded_window_count = self.total_committed_window_count
 
@@ -916,13 +968,10 @@ class History:
 
     @staticmethod
     def _behavior_role_score_from_components(components: Mapping[str, float]) -> float:
-        score = 0.0
-        score += 0.20 * float(components.get("source_out_degree_quantile", 0.0))
-        score += 0.15 * float(components.get("destination_in_degree_quantile", 0.0))
-        score += 0.15 * float(components.get("normalized_byte_ratio", 0.0))
-        score += 0.20 * float(components.get("source_role_drift", 0.0))
-        score += 0.15 * float(components.get("destination_role_drift", 0.0))
-        score += 0.15 * float(components.get("previous_attack_dst_to_src_mark", 0.0))
+        score = sum(
+            BEHAVIOR_ROLE_WEIGHTS[name] * float(components.get(name, 0.0))
+            for name in BEHAVIOR_ROLE_WEIGHTS
+        )
         return min(max(score, 0.0), 1.0)
 
     def compute_behavior_role_anomaly_scores(

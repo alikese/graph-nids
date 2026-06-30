@@ -6,6 +6,10 @@ from feature.node.nodeClass import node
 from feature.packet.packetclass import packet
 
 
+AUTH_BRUTEFORCE_PORTS = {21, 22}
+TCP_PROTOCOL = 6
+
+
 class TrafficGraph:
     """
     从单个时间窗口 CSV 的包数据构建流量图。
@@ -18,6 +22,7 @@ class TrafficGraph:
         self.nodes: Dict[str, node] = {}
         self.edges: Dict[Tuple[str, str, int, int, int], edge] = {}
         self.packets: List[packet] = []
+        self.auth_service_stats = {}
 
     def _get_or_create_node(self, ip: str) -> node:
         if ip not in self.nodes:
@@ -62,7 +67,91 @@ class TrafficGraph:
         dst_node = self._get_or_create_node(dst_ip)
         src_node.add_out_edge(edge_key)
         dst_node.add_in_edge(edge_key)
+        self._add_auth_service_stat(
+            edge_key=edge_key,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=src_port,
+            dst_port=dst_port,
+            protocol=protocol,
+            timestamp=float(pkt.timestamp),
+            payload_len=float(pkt.payload_len),
+            flags_map=flags_map,
+        )
         self.packets.append(pkt)
+
+    def _add_auth_service_stat(
+        self,
+        edge_key,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        protocol,
+        timestamp,
+        payload_len,
+        flags_map,
+    ):
+        if protocol != TCP_PROTOCOL:
+            return
+
+        if dst_port in AUTH_BRUTEFORCE_PORTS:
+            service_key = (src_ip, dst_ip, dst_port, protocol)
+            service_port = dst_port
+            client_port = src_port
+            direction = "client"
+        elif src_port in AUTH_BRUTEFORCE_PORTS:
+            service_key = (dst_ip, src_ip, src_port, protocol)
+            service_port = src_port
+            client_port = dst_port
+            direction = "server"
+        else:
+            return
+
+        stats = self.auth_service_stats.setdefault(
+            service_key,
+            {
+                "auth_key": service_key,
+                "service_edge_key": service_key,
+                "service_port": service_port,
+                "protocol": protocol,
+                "sessions": {},
+                "client_packets": 0,
+                "server_packets": 0,
+                "zero_payload_packets": 0,
+                "small_payload_packets": 0,
+                "edge_keys": set(),
+            },
+        )
+        if direction == "client":
+            stats["edge_keys"].add(edge_key)
+            stats["client_packets"] += 1
+        else:
+            stats["server_packets"] += 1
+        if payload_len == 0:
+            stats["zero_payload_packets"] += 1
+        if payload_len <= 64:
+            stats["small_payload_packets"] += 1
+
+        session = stats["sessions"].setdefault(
+            client_port,
+            {
+                "first_ts": timestamp,
+                "last_ts": timestamp,
+                "byte_count": 0.0,
+                "packet_count": 0,
+                "rst_packets": 0,
+                "fin_packets": 0,
+            },
+        )
+        session["first_ts"] = min(float(session["first_ts"]), timestamp)
+        session["last_ts"] = max(float(session["last_ts"]), timestamp)
+        session["byte_count"] += payload_len
+        session["packet_count"] += 1
+        if flags_map.get("RST", False):
+            session["rst_packets"] += 1
+        if flags_map.get("FIN", False):
+            session["fin_packets"] += 1
 
     @classmethod
     def from_window_csv(cls, csv_path: str):

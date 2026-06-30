@@ -207,7 +207,13 @@ def compute_auth_bruteforce_scores(
         )
         components["auth_bruteforce_score"] = score
 
-        results[edge_key] = components if return_components else score
+        result_value = components if return_components else score
+        edge_keys = stats.get("edge_keys")
+        if edge_keys:
+            for concrete_edge_key in edge_keys:
+                results[concrete_edge_key] = result_value
+        else:
+            results[edge_key] = result_value
     return results
 
 

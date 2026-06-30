@@ -67,6 +67,37 @@ def evidence_decision(
     auth_suspicious_threshold: float = 0.60,
     signal_thresholds: Optional[Mapping[str, Any]] = None,
 ) -> dict:
+    decision_settings = observation.get("decision", {}) or {}
+    attack_threshold = _score(
+        decision_settings.get("attack_threshold", attack_threshold)
+    )
+    suspicious_threshold = _score(
+        decision_settings.get("suspicious_threshold", suspicious_threshold)
+    )
+    normal_threshold = _score(
+        decision_settings.get("normal_threshold", normal_threshold)
+    )
+    try:
+        min_strong_signals = int(
+            decision_settings.get("min_strong_signals", min_strong_signals)
+        )
+    except (TypeError, ValueError):
+        min_strong_signals = int(min_strong_signals)
+    auth_attack_threshold = _score(
+        decision_settings.get("auth_attack_threshold", auth_attack_threshold)
+    )
+    auth_suspicious_threshold = _score(
+        decision_settings.get(
+            "auth_suspicious_threshold",
+            auth_suspicious_threshold,
+        )
+    )
+    signal_thresholds = (
+        observation.get("signal_thresholds")
+        or decision_settings.get("signal_thresholds")
+        or signal_thresholds
+    )
+
     sub_scores = observation.get("sub_scores", {}) or {}
     local_score = _score(
         sub_scores.get(

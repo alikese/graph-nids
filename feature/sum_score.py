@@ -13,6 +13,7 @@ LOCAL_ANOMALY_WEIGHTS = {
     "approximate_novelty_anomaly_score": 0.15,
     "behavior_role_anomaly_score": 0.20,
 }
+DEFAULT_LOCAL_ANOMALY_WEIGHTS = dict(LOCAL_ANOMALY_WEIGHTS)
 
 ATTACK_CHAIN_WEIGHTS = {
     "edge_low_activity_score": 0.15,
@@ -29,6 +30,27 @@ def _clamp_score(score: Any) -> float:
     except (TypeError, ValueError):
         score_value = 0.0
     return min(max(score_value, 0.0), 1.0)
+
+
+def _normalized_local_anomaly_weights(weights: Mapping[str, Any]) -> Dict[str, float]:
+    cleaned = {
+        name: max(float(weights.get(name, 0.0)), 0.0)
+        for name in DEFAULT_LOCAL_ANOMALY_WEIGHTS
+    }
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return dict(DEFAULT_LOCAL_ANOMALY_WEIGHTS)
+    return {name: value / total for name, value in cleaned.items()}
+
+
+def set_local_anomaly_weights(weights: Mapping[str, Any]):
+    LOCAL_ANOMALY_WEIGHTS.clear()
+    LOCAL_ANOMALY_WEIGHTS.update(_normalized_local_anomaly_weights(weights))
+
+
+def reset_local_anomaly_weights():
+    LOCAL_ANOMALY_WEIGHTS.clear()
+    LOCAL_ANOMALY_WEIGHTS.update(DEFAULT_LOCAL_ANOMALY_WEIGHTS)
 
 
 def local_anomaly_score(
@@ -183,9 +205,12 @@ def compute_local_anomaly_scores(
 __all__ = [
     "ATTACK_CHAIN_BASE_SCORE",
     "ATTACK_CHAIN_WEIGHTS",
+    "DEFAULT_LOCAL_ANOMALY_WEIGHTS",
     "LOCAL_ANOMALY_WEIGHTS",
     "attack_chain_evidence_score",
     "compute_local_anomaly_scores",
     "local_anomaly_score",
     "local_anomaly_score_from_components",
+    "reset_local_anomaly_weights",
+    "set_local_anomaly_weights",
 ]

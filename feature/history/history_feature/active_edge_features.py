@@ -1,5 +1,5 @@
 import math
-from typing import Any, ClassVar, Dict, Iterable, List, Optional
+from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional
 
 from feature.attack_similar.previous_attack_edge import edge_key_from_edge_obj
 
@@ -28,6 +28,28 @@ class EdgeActiveHistoryFeature:
         "edge_protocol_flags_active_drift_distance": 0.20,
         "edge_time_behavior_active_drift_distance": 0.20,
     }
+    DEFAULT_FINITE_HISTORY_OFFSET_WEIGHTS: ClassVar[Dict[str, float]] = dict(
+        FINITE_HISTORY_OFFSET_WEIGHTS
+    )
+
+    @classmethod
+    def set_finite_history_offset_weights(cls, weights: Mapping[str, Any]):
+        cleaned = {
+            name: max(float(weights.get(name, 0.0)), 0.0)
+            for name in cls.DEFAULT_FINITE_HISTORY_OFFSET_WEIGHTS
+        }
+        total = sum(cleaned.values())
+        if total <= 0.0:
+            cleaned = dict(cls.DEFAULT_FINITE_HISTORY_OFFSET_WEIGHTS)
+        else:
+            cleaned = {name: value / total for name, value in cleaned.items()}
+        cls.FINITE_HISTORY_OFFSET_WEIGHTS = cleaned
+
+    @classmethod
+    def reset_finite_history_offset_weights(cls):
+        cls.FINITE_HISTORY_OFFSET_WEIGHTS = dict(
+            cls.DEFAULT_FINITE_HISTORY_OFFSET_WEIGHTS
+        )
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -69,16 +91,16 @@ class EdgeActiveHistoryFeature:
     def _history_record_for_edge(cls, edge_obj: Any, history: Any):
         """通过对象身份或标准边 key 查找 history 记录。"""
         history_edges = getattr(history, "edges", {})
+        edge_key = edge_key_from_edge_obj(edge_obj)
+        if edge_key is not None and edge_key in history_edges:
+            return history_edges.get(edge_key)
+
         for record in history_edges.values():
             if (
                 getattr(record, "obj", None) is edge_obj
                 or getattr(record, "current_window_obj", None) is edge_obj
             ):
                 return record
-
-        edge_key = edge_key_from_edge_obj(edge_obj)
-        if edge_key is not None:
-            return history_edges.get(edge_key)
         return None
 
     @classmethod

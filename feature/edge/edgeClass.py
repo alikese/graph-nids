@@ -1,6 +1,39 @@
 import math
 
 
+DEFAULT_CURRENT_BEHAVIOR_WEIGHTS = {
+    "small_packet_ratio": 0.15,
+    "zero_payload_ratio": 0.10,
+    "syn_without_ack_ratio": 0.20,
+    "handshake_failure_score": 0.20,
+    "rst_ratio": 0.10,
+    "burstiness_score": 0.10,
+    "flags_entropy_score": 0.15,
+}
+CURRENT_BEHAVIOR_WEIGHTS = dict(DEFAULT_CURRENT_BEHAVIOR_WEIGHTS)
+
+
+def _normalized_weights(weights):
+    cleaned = {
+        name: max(float(weights.get(name, 0.0)), 0.0)
+        for name in DEFAULT_CURRENT_BEHAVIOR_WEIGHTS
+    }
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return dict(DEFAULT_CURRENT_BEHAVIOR_WEIGHTS)
+    return {name: value / total for name, value in cleaned.items()}
+
+
+def set_current_behavior_weights(weights):
+    CURRENT_BEHAVIOR_WEIGHTS.clear()
+    CURRENT_BEHAVIOR_WEIGHTS.update(_normalized_weights(weights))
+
+
+def reset_current_behavior_weights():
+    CURRENT_BEHAVIOR_WEIGHTS.clear()
+    CURRENT_BEHAVIOR_WEIGHTS.update(DEFAULT_CURRENT_BEHAVIOR_WEIGHTS)
+
+
 class EdgeWindowBuffer:
     """
     当前窗口边暂存容器。
@@ -626,14 +659,19 @@ class edge:
                 eps=eps,
             )
 
-        score = 0.0
-        score += 0.15 * self.small_packet_ratio(eps=eps)
-        score += 0.10 * self.zero_payload_ratio(eps=eps)
-        score += 0.20 * self.syn_without_ack_ratio(eps=eps)
-        score += 0.20 * self.handshake_failure_score(eps=eps)
-        score += 0.10 * self.rst_ratio(eps=eps)
-        score += 0.10 * min(max(float(burstiness_score), 0.0), 1.0)
-        score += 0.15 * self.flags_entropy_score()
+        components = {
+            "small_packet_ratio": self.small_packet_ratio(eps=eps),
+            "zero_payload_ratio": self.zero_payload_ratio(eps=eps),
+            "syn_without_ack_ratio": self.syn_without_ack_ratio(eps=eps),
+            "handshake_failure_score": self.handshake_failure_score(eps=eps),
+            "rst_ratio": self.rst_ratio(eps=eps),
+            "burstiness_score": min(max(float(burstiness_score), 0.0), 1.0),
+            "flags_entropy_score": self.flags_entropy_score(),
+        }
+        score = sum(
+            CURRENT_BEHAVIOR_WEIGHTS[name] * components[name]
+            for name in CURRENT_BEHAVIOR_WEIGHTS
+        )
 
         return min(max(score, 0.0), 1.0)
 

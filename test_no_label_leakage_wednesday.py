@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from feature.attack_similar.previous_attack_edge import build_recent_attack_edge_index
+from feature.auth_bruteforce import compute_auth_bruteforce_scores
 from feature.history.historyClass import History
 from feature.history.history_feature.active_edge_features import EdgeActiveHistoryFeature
 from feature.sum_score import attack_chain_evidence_score, local_anomaly_score
@@ -201,6 +202,14 @@ def score_window(graph, history, return_timing=False):
     timings["current_behavior"] = time.perf_counter() - stage_start
 
     stage_start = time.perf_counter()
+    auth_components_by_edge = compute_auth_bruteforce_scores(
+        graph,
+        history=history,
+        return_components=True,
+    )
+    timings["auth_bruteforce"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     role_scores = history.compute_behavior_role_anomaly_scores(
         graph,
         current_window_only=False,
@@ -213,12 +222,19 @@ def score_window(graph, history, return_timing=False):
     suspicious_diffusion_index = (
         history.suspicious_edge_history.build_destination_to_source_diffusion_index()
     )
+    has_attack_context = bool(
+        history.get_previous_attack_destination_ips()
+        or history.recent_attack_edge_history.summary().get(
+            "retained_exact_attack_edge_count", 0
+        )
+    )
     scores = {}
     observations = {}
     for edge_key, edge_obj in graph.edges.items():
         finite_components = finite_scores.get(id(edge_obj), {})
         novelty_components = novelty_scores.get(edge_key, {})
         role_components = role_scores.get(edge_key, {})
+        auth_components = auth_components_by_edge.get(edge_key, {})
         score_components = local_anomaly_score(
             current_scores.get(edge_key, 0.0),
             finite_components.get("finite_history_offset_anomaly_score", 0.0),
@@ -270,8 +286,10 @@ def score_window(graph, history, return_timing=False):
             **finite_components,
             **novelty_components,
             **role_components,
+            **auth_components,
             "suspicious_diffusion_score": suspicious_diffusion_score,
             "attack_chain_score": attack_chain_score,
+            "has_attack_context": has_attack_context,
         }
         observations[edge_key] = {
             "score": score,
@@ -288,6 +306,9 @@ def score_window(graph, history, return_timing=False):
                 "behavior_role_anomaly_score": score_components[
                     "behavior_role_anomaly_score"
                 ],
+                "auth_bruteforce_score": auth_components.get(
+                    "auth_bruteforce_score", 0.0
+                ),
             },
             "feature_vector": feature_vector,
             "attack_similarity_score": attack_similarity_score,

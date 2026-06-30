@@ -12,6 +12,28 @@ APPROXIMATE_NOVELTY_WEIGHTS = {
     "source_destination_diversity_burst_score": 0.15,
     "source_port_diversity_burst_score": 0.10,
 }
+DEFAULT_APPROXIMATE_NOVELTY_WEIGHTS = dict(APPROXIMATE_NOVELTY_WEIGHTS)
+
+
+def _normalized_approximate_novelty_weights(weights: Mapping[str, Any]) -> Dict[str, float]:
+    cleaned = {
+        name: max(float(weights.get(name, 0.0)), 0.0)
+        for name in DEFAULT_APPROXIMATE_NOVELTY_WEIGHTS
+    }
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return dict(DEFAULT_APPROXIMATE_NOVELTY_WEIGHTS)
+    return {name: value / total for name, value in cleaned.items()}
+
+
+def set_approximate_novelty_weights(weights: Mapping[str, Any]):
+    APPROXIMATE_NOVELTY_WEIGHTS.clear()
+    APPROXIMATE_NOVELTY_WEIGHTS.update(_normalized_approximate_novelty_weights(weights))
+
+
+def reset_approximate_novelty_weights():
+    APPROXIMATE_NOVELTY_WEIGHTS.clear()
+    APPROXIMATE_NOVELTY_WEIGHTS.update(DEFAULT_APPROXIMATE_NOVELTY_WEIGHTS)
 
 
 def _resolve_edge_key(edge_or_key: Any) -> Optional[Hashable]:
@@ -1144,6 +1166,7 @@ def compute_recent_new_edge_marks(
 
 __all__ = [
     "APPROXIMATE_NOVELTY_WEIGHTS",
+    "DEFAULT_APPROXIMATE_NOVELTY_WEIGHTS",
     "approximate_novelty_anomaly_score",
     "approximate_rare_edge_score",
     "compute_approximate_novelty_anomaly_scores",
@@ -1159,6 +1182,8 @@ __all__ = [
     "recent_detail_edge_keys",
     "recent_edge_frequency_estimate",
     "recent_new_edge_mark",
+    "reset_approximate_novelty_weights",
+    "set_approximate_novelty_weights",
     "source_destination_diversity_burst_score",
     "source_port_diversity_burst_score",
 ]
