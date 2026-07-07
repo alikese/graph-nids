@@ -132,6 +132,9 @@ class SuspiciousEdgeHistory:
         attack_chain_threshold: float = 0.85,
         auth_attack_threshold: float = 0.80,
         auth_suspicious_threshold: float = 0.60,
+        attack_similarity_threshold: float = 0.70,
+        score_only_attack_threshold: bool = False,
+        strict_suspicious_promotion: bool = False,
         reinforcing_signal_bonus: float = 0.04,
         suspicious_diffusion_weight: float = 0.25,
         attack_diffusion_weight: float = 1.0,
@@ -169,6 +172,9 @@ class SuspiciousEdgeHistory:
         self.attack_chain_threshold = float(attack_chain_threshold)
         self.auth_attack_threshold = float(auth_attack_threshold)
         self.auth_suspicious_threshold = float(auth_suspicious_threshold)
+        self.attack_similarity_threshold = float(attack_similarity_threshold)
+        self.score_only_attack_threshold = bool(score_only_attack_threshold)
+        self.strict_suspicious_promotion = bool(strict_suspicious_promotion)
         self.reinforcing_signal_bonus = float(reinforcing_signal_bonus)
         self.suspicious_diffusion_weight = float(suspicious_diffusion_weight)
         self.attack_diffusion_weight = float(attack_diffusion_weight)
@@ -255,11 +261,28 @@ class SuspiciousEdgeHistory:
         self,
         observation: SuspiciousEdgeObservation,
     ) -> bool:
+        if self.score_only_attack_threshold:
+            return True
         if self._auth_score(observation) >= self.auth_attack_threshold:
             return True
         if self._has_attack_context(observation):
             return True
         return _clamp(observation.attack_similarity_score) > 0.0
+
+    def _has_strong_attack_evidence(
+        self,
+        observation: SuspiciousEdgeObservation,
+        record: Optional[SuspiciousEdgeRecord] = None,
+    ) -> bool:
+        if self._auth_score(observation) >= self.auth_attack_threshold:
+            return True
+        if _clamp(observation.attack_chain_score) >= self.attack_chain_threshold:
+            return True
+        if _clamp(observation.attack_similarity_score) >= self.attack_similarity_threshold:
+            return True
+        if record is not None and record.attack_similarity_score >= self.attack_similarity_threshold:
+            return True
+        return False
 
     def _age_record(self, record: SuspiciousEdgeRecord) -> bool:
         if record.ttl is not None:
@@ -346,7 +369,13 @@ class SuspiciousEdgeHistory:
         self,
         record: SuspiciousEdgeRecord,
         reinforcing_signals: tuple,
+        observation: SuspiciousEdgeObservation,
     ) -> bool:
+        if self.strict_suspicious_promotion and not self._has_strong_attack_evidence(
+            observation,
+            record,
+        ):
+            return False
         return (
             record.consecutive_suspicious_count >= self.min_consecutive_windows
             and len(reinforcing_signals) >= self.min_reinforcing_signals
@@ -473,7 +502,7 @@ class SuspiciousEdgeHistory:
                 else:
                     reinforcing_signals = self._update_record(record, observation)
 
-                if self._should_promote(record, reinforcing_signals):
+                if self._should_promote(record, reinforcing_signals, observation):
                     self.edges.pop(edge_key, None)
                     result.promoted_attack_edges.add(edge_key)
                     result.decisions[edge_key] = SuspiciousEdgeDecision(

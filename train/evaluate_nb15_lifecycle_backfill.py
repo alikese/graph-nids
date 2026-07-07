@@ -58,6 +58,12 @@ def parse_args():
         default=ROOT / "train" / "nb15_lifecycle_backfill_progress.log",
     )
     parser.add_argument("--progress-every", type=int, default=100)
+    parser.add_argument("--window-start", type=int, default=0)
+    parser.add_argument("--max-windows", type=int, default=0)
+    parser.add_argument("--attack-threshold", type=float)
+    parser.add_argument("--suspicious-threshold", type=float)
+    parser.add_argument("--strict-suspicious-promotion", action="store_true")
+    parser.add_argument("--score-only-direct-attack", action="store_true")
     return parser.parse_args()
 
 
@@ -85,6 +91,23 @@ def ordered_files(window_dir, day):
     return sorted(window_dir.glob(f"{day}-ip_*.csv"), key=lambda path: path.name)
 
 
+def select_contiguous_files(files, start_index, max_windows):
+    start_index = max(int(start_index), 0)
+    if start_index >= len(files):
+        return []
+    if not max_windows or max_windows <= 0:
+        return files[start_index:]
+    return files[start_index : start_index + int(max_windows)]
+
+
+def threshold_label(score, attack_threshold, suspicious_threshold):
+    if score >= attack_threshold:
+        return "attack"
+    if score >= suspicious_threshold:
+        return "suspicious"
+    return "normal"
+
+
 def score_result(score_stats):
     return {
         "approximate_auc": approximate_auc(
@@ -104,7 +127,11 @@ def score_result(score_stats):
 
 def main():
     args = parse_args()
-    files = ordered_files(args.window_dir, args.day)
+    files = select_contiguous_files(
+        ordered_files(args.window_dir, args.day),
+        args.window_start,
+        args.max_windows,
+    )
     if not files:
         raise FileNotFoundError(
             f"no {args.day} windows found in {args.window_dir}"
@@ -122,6 +149,22 @@ def main():
         loaded_score_profile = load_active_score_profile(args.score_profile_path)
 
     history = History(life_windows=30, detail_windows=5)
+    if args.attack_threshold is not None:
+        history.suspicious_edge_history.theta_attack = float(args.attack_threshold)
+    if args.suspicious_threshold is not None:
+        history.suspicious_edge_history.theta_suspicious = float(
+            args.suspicious_threshold
+        )
+    if args.attack_threshold is not None and args.suspicious_threshold is not None:
+        history.suspicious_edge_history.promotion_evidence_threshold = (
+            float(args.attack_threshold) + float(args.suspicious_threshold)
+        ) / 2.0
+    history.suspicious_edge_history.strict_suspicious_promotion = bool(
+        args.strict_suspicious_promotion
+    )
+    history.suspicious_edge_history.score_only_attack_threshold = bool(
+        args.score_only_direct_attack
+    )
     predicted_counts = Counter()
     lifecycle_final_counts = Counter()
     lifecycle_pending = {}
@@ -150,10 +193,20 @@ def main():
             history,
             return_timing=True,
         )
-        threshold_labels = {
-            edge_key: predicted_label_from_observation(observations[edge_key])
-            for edge_key in scores
-        }
+        if args.attack_threshold is not None and args.suspicious_threshold is not None:
+            threshold_labels = {
+                edge_key: threshold_label(
+                    score,
+                    args.attack_threshold,
+                    args.suspicious_threshold,
+                )
+                for edge_key, score in scores.items()
+            }
+        else:
+            threshold_labels = {
+                edge_key: predicted_label_from_observation(observations[edge_key])
+                for edge_key in scores
+            }
 
         stage_started_at = time.perf_counter()
         suspicious_result, final_labels = commit_window(
@@ -250,8 +303,14 @@ def main():
         "day": args.day,
         "window_dir": str(args.window_dir),
         "window_count": len(files),
+        "window_start": args.window_start,
+        "max_windows": args.max_windows,
         "elapsed_seconds": elapsed_seconds,
         "weights_path": str(args.weights_path),
+        "attack_threshold_override": args.attack_threshold,
+        "suspicious_threshold_override": args.suspicious_threshold,
+        "strict_suspicious_promotion": bool(args.strict_suspicious_promotion),
+        "score_only_direct_attack": bool(args.score_only_direct_attack),
         "score_profile_path": (
             str(args.score_profile_path) if args.score_profile_path else None
         ),
